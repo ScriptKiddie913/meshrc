@@ -54,7 +54,7 @@ no need to re-run setup.
 |---|---|
 | `~/.sdmesh/config.json` | username, node id, render URL, **public** keys — plaintext |
 | `~/.sdmesh/identity.enc.json` | private keys + auth token — AES-256-GCM, passphrase-derived key (scrypt) |
-| `~/.sdmesh/mesh.db` | local event log mirror, peer cache, message history, outbox — SQLite |
+| `~/.sdmesh/mesh.db` | local event log mirror, peer cache, message history, outbox — SQLite (`node:sqlite`, built into Node — no native build) |
 
 ## Crypto
 
@@ -95,4 +95,10 @@ Or edit `~/.sdmesh/config.json` → `render_url` after the fact.
 
 ## Requirements
 
-Node.js >= 18. That's it — `setup.sh` handles `npm install`.
+Node.js >= 22.13.0. That's it — `setup.sh` handles `npm install`.
+
+Storage uses Node's built-in `node:sqlite` (no `better-sqlite3`, no native
+build step), so `npm install` never touches node-gyp/Python/a C++ toolchain
+— it just pulls in `ws`. If `setup.sh` complains about your Node version,
+upgrade (`nvm install --lts && nvm use --lts`) rather than downgrading the
+client.

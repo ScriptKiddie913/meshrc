@@ -1,15 +1,17 @@
 "use strict";
 
-const Database = require("better-sqlite3");
+const { DatabaseSync } = require("node:sqlite");
 
 /**
  * Local mirror of mesh state. Per the architecture: Render is not the only
  * data copy. Every client keeps its own event log, peer cache, message
  * history, and backup — so the mesh keeps functioning if Render is down.
+ *
+ * Uses Node's built-in node:sqlite (no native build step, no node-gyp).
  */
 function open(dbPath) {
-  const db = new Database(dbPath);
-  db.pragma("journal_mode = WAL");
+  const db = new DatabaseSync(dbPath);
+  db.exec("PRAGMA journal_mode = WAL");
 
   db.exec(`
     CREATE TABLE IF NOT EXISTS meta (

@@ -7,4 +7,4 @@ if [ ! -d node_modules ]; then
   exit 1
 fi
 
-exec node src/index.js "$@"
+exec node --no-warnings src/index.js "$@"

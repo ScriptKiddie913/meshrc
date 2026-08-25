@@ -5,14 +5,13 @@
   "main": "src/index.js",
   "type": "commonjs",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.13.0"
   },
   "scripts": {
-    "setup": "node src/setup.js",
-    "start": "node src/index.js"
+    "setup": "node --no-warnings src/setup.js",
+    "start": "node --no-warnings src/index.js"
   },
   "dependencies": {
-    "better-sqlite3": "^11.3.0",
     "ws": "^8.18.0"
   },
   "license": "MIT"
