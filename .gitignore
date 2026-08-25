@@ -1,0 +1,10 @@
+node_modules/
+*.log
+.DS_Store
+
+# Local runtime state never belongs in git — it lives in ~/.sdmesh, not here.
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm

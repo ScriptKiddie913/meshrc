@@ -1,0 +1,19 @@
+{
+  "name": "sdmesh-client",
+  "version": "1.0.0",
+  "description": "Secure De-centralized Mesh - client (identity, local encrypted state, CLI). Talks to a headless sdmesh-server on Render.",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=18"
+  },
+  "scripts": {
+    "setup": "node src/setup.js",
+    "start": "node src/index.js"
+  },
+  "dependencies": {
+    "better-sqlite3": "^11.3.0",
+    "ws": "^8.18.0"
+  },
+  "license": "MIT"
+}
