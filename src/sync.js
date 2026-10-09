@@ -5,37 +5,54 @@ const cryptoUtil = require("./crypto");
 
 /**
  * Push whatever's in the local outbox, pull whatever the server has that we
- * don't. This is how a client (or the whole mesh) recovers after either side
- * was offline — same mechanism whether it's a dropped wifi connection or a
- * Render outage.
+ * don't. Loops on has_more until fully synchronized (C10).
  */
 async function syncNow(ctx) {
-  const outbox = ctx.db.listOutbox().map((row) => ({
-    client_event_id: row.client_event_id,
-    event_type: row.event_type,
-    payload: JSON.parse(row.payload),
-    signature: row.signature || undefined,
-  }));
+  let hasMore = true;
+  let lastRes = null;
 
-  const res = await api.sync(ctx.renderUrl, ctx.auth, {
-    sinceGlobalSeq: ctx.db.lastGlobalSeq(),
-    newEvents: outbox,
-  });
+  while (hasMore) {
+    const outbox = ctx.db.listOutbox().map((row) => ({
+      client_event_id: row.client_event_id,
+      event_type: row.event_type,
+      payload: JSON.parse(row.payload),
+      signature: row.signature || undefined,
+    }));
 
-  for (const clientEventId of res.accepted || []) {
-    ctx.db.clearOutboxEntry(clientEventId);
+    const res = await api.sync(
+      ctx.renderUrl,
+      ctx.auth,
+      {
+        sinceGlobalSeq: ctx.db.lastGlobalSeq(),
+        newEvents: outbox,
+      },
+      { agent: ctx.agent }
+    );
+    lastRes = res;
+
+    for (const clientEventId of res.accepted || []) {
+      ctx.db.clearOutboxEntry(clientEventId);
+      ctx.db.markMessageStatus(clientEventId, "stored", res.global_seq);
+    }
+
+    const missingEvents = res.items || res.missing_events || [];
+    applyMissingEvents(ctx, missingEvents);
+    ctx.lastSyncAt = Date.now();
+
+    hasMore = !!res.has_more;
+    // Safety check to avoid infinite loops if server reports has_more with 0 items
+    if (hasMore && missingEvents.length === 0) {
+      break;
+    }
   }
 
-  applyMissingEvents(ctx, res.missing_events || []);
-  ctx.lastSyncAt = Date.now();
-  return res;
+  return lastRes;
 }
 
-/** Apply server event rows into local state: peer registry + decrypted inbox. */
+/** Apply server event rows into local state: peer registry + decrypted inbox (C6). */
 function applyMissingEvents(ctx, events) {
   for (const ev of events) {
     const isNew = ctx.db.applyEvent(ev);
-    if (!isNew) continue;
 
     let payload;
     try {
@@ -45,9 +62,6 @@ function applyMissingEvents(ctx, events) {
     }
 
     if (ev.event_type === "USER_REGISTERED" || ev.event_type === "KEY_REGISTERED") {
-      // We only get the full picture (username + public_key together) once
-      // both events for a node have landed, or via /peers below — best
-      // effort here, reconciled fully by refreshPeers().
       continue;
     }
 
@@ -55,17 +69,22 @@ function applyMissingEvents(ctx, events) {
       const targetNodeId = payload.target_node_id;
       if (targetNodeId !== ctx.nodeId) continue; // not addressed to us
       const sender = ctx.db.getPeerByNodeId(ev.node_id);
-      if (!sender) continue; // unknown sender key — can't decrypt yet, will retry after /peers refresh
+      if (!sender) continue; // unknown sender key
       try {
         const sharedKey = cryptoUtil.deriveSharedKey(ctx.identity.ecdhPrivate, sender.ecdh_public);
         const plaintext = cryptoUtil.decryptMessage(payload.ciphertext, sharedKey);
-        ctx.db.addMessage({
+        
+        // Single ingest path with deduplication (C6)
+        ctx.db.ingestMessage({
           direction: "in",
           peerNodeId: ev.node_id,
           peerUsername: sender.username,
           plaintext,
           status: "received",
+          clientEventId: ev.client_event_id || null,
           globalSeq: ev.global_seq,
+          eventId: ev.event_id,
+          timestamp: ev.timestamp,
         });
       } catch {
         // Not encrypted to us / corrupt — ignore.

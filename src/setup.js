@@ -8,6 +8,7 @@ const localdb = require("./localdb");
 const api = require("./api");
 const ui = require("./ui");
 const { ask, askHidden, closeShared } = require("./prompt");
+const { isV3OnionAddress, detectTorSocksPort, createTorAgent } = require("./tor");
 
 const USERNAME_RE = /^[a-zA-Z0-9_-]{2,32}$/;
 
@@ -29,10 +30,25 @@ async function main() {
   let renderUrl = argRenderUrl || (await ask(`Render endpoint [${config.DEFAULT_RENDER_URL}]: `));
   renderUrl = (renderUrl || config.DEFAULT_RENDER_URL).trim().replace(/\/+$/, "");
 
-  process.stdout.write(ui.info("Checking Render endpoint... "));
+  let agent = null;
+  let detectedSocksPort = null;
+  if (isV3OnionAddress(renderUrl)) {
+    detectedSocksPort = await detectTorSocksPort();
+    if (!detectedSocksPort) {
+      console.log(ui.warn("\n[!] Onion address detected, but Tor is not running locally on your machine!"));
+      console.log(ui.warn("    To reach .onion services, please start Tor:"));
+      console.log(ui.info("      • Simply open Tor Browser (provides proxy on 127.0.0.1:9150), OR"));
+      console.log(ui.info("      • Run the Tor service in terminal: 'tor' (runs on 127.0.0.1:9050)\n"));
+    } else {
+      console.log(ui.ok(`✓ Tor SOCKS proxy detected on 127.0.0.1:${detectedSocksPort}`));
+      agent = createTorAgent({ socksPort: detectedSocksPort });
+    }
+  }
+
+  process.stdout.write(ui.info("Checking Render endpoint (waiting for Tor circuit)... "));
   try {
-    const h = await api.health(renderUrl);
-    console.log(ui.ok(`ok (service: ${h.service}, global_seq: ${h.global_seq})`));
+    const h = await api.health(renderUrl, { agent, timeoutMs: 45000 });
+    console.log(ui.ok(`ok (status: ${h.status || "ok"})`));
   } catch (err) {
     console.log(ui.warn(`unreachable (${err.message})`));
     const cont = await ask("Continue anyway and set up offline? (y/N): ");
@@ -48,9 +64,14 @@ async function main() {
   }
 
   let passphrase = "";
-  while (passphrase.length < 8) {
-    passphrase = await askHidden("Vault passphrase (min 8 chars, encrypts your private keys at rest): ");
-    if (passphrase.length < 8) console.log(ui.warn("Too short."));
+  while (true) {
+    passphrase = await askHidden("Vault passphrase (min 12 chars, encrypts your private keys & DB at rest): ");
+    const strength = identityCrypto.checkPassphraseStrength(passphrase);
+    if (!strength.valid) {
+      console.log(ui.warn(strength.message));
+      continue;
+    }
+    break;
   }
   const confirm = await askHidden("Confirm passphrase: ");
   if (confirm !== passphrase) {
@@ -63,6 +84,9 @@ async function main() {
   console.log(ui.ok("  ✓ Signing keypair generated (Ed25519)"));
   console.log(ui.ok("  ✓ Encryption keypair generated (X25519)"));
 
+  const dataKey = identityCrypto.generateDataKey();
+  console.log(ui.ok("  ✓ Random 256-bit DB data key generated"));
+
   const nodeId = `${username}-${crypto.randomBytes(4).toString("hex")}`;
   console.log(ui.ok(`  ✓ Node ID: ${nodeId}`));
 
@@ -71,7 +95,7 @@ async function main() {
   let registration = null;
   try {
     process.stdout.write(ui.info("\nRegistering with mesh... "));
-    registration = await api.register(renderUrl, { username, nodeId, publicKey });
+    registration = await api.register(renderUrl, { username, nodeId, publicKey }, { agent });
     console.log(ui.ok("ok"));
   } catch (err) {
     console.log(ui.warn(`failed (${err.message})`));
@@ -85,21 +109,23 @@ async function main() {
     node_id: nodeId,
     sign_public: identity.signPublic,
     ecdh_public: identity.ecdhPublic,
+    socks_port: detectedSocksPort,
     registered: !!registration,
     created_at: Date.now(),
   });
 
-  // Persist encrypted secrets (private keys + bearer token).
+  // Persist encrypted secrets (private keys + bearer token + data key).
   const secretPayload = {
     sign_private: identity.signPrivate,
     ecdh_private: identity.ecdhPrivate,
     token: registration ? registration.token : null,
+    data_key: dataKey.toString("hex"),
   };
   config.saveIdentityBlob(identityCrypto.encryptBlob(secretPayload, passphrase));
   console.log(ui.ok("  ✓ Identity encrypted and stored (~/.sdmesh/identity.enc.json)"));
 
   // Initialize local event/peer/message store, seeded from registration if we got one.
-  const db = localdb.open(config.DB_PATH);
+  const db = localdb.open(config.DB_PATH, { dataKey });
   if (registration) {
     for (const p of registration.peers || []) {
       if (p.node_id === nodeId) continue;

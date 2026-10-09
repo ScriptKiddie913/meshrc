@@ -8,22 +8,15 @@ const RECONNECT_MIN_MS = 2000;
 const RECONNECT_MAX_MS = 30000;
 
 /**
- * Persistent connection to Render's /ws relay. Emits:
- *   'open', 'close', 'error'
- *   'peers'        { peers }
- *   'presence'     { node_id, status }
- *   'peer_update'  { node }
- *   'message'      { from, ciphertext, global_seq }
- *   'message_delivered' { target_node_id, global_seq }
- *   'message_queued'    { target_node_id, global_seq }
- *   'sync_events'  { events }
+ * Persistent connection to mesh /ws relay.
  */
 class MeshSocket extends EventEmitter {
-  constructor(wsUrl, { nodeId, token }) {
+  constructor(wsUrl, { nodeId, token }, options = {}) {
     super();
     this.wsUrl = wsUrl;
     this.nodeId = nodeId;
     this.token = token;
+    this.agent = options.agent || null;
     this.ws = null;
     this.heartbeatTimer = null;
     this.reconnectTimer = null;
@@ -41,7 +34,12 @@ class MeshSocket extends EventEmitter {
     this.wantConnected = false;
     clearTimeout(this.reconnectTimer);
     clearInterval(this.heartbeatTimer);
-    if (this.ws) this.ws.close();
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {}
+    }
+    this.connected = false;
   }
 
   send(obj) {
@@ -53,8 +51,16 @@ class MeshSocket extends EventEmitter {
   }
 
   _connect() {
-    const url = `${this.wsUrl}?node_id=${encodeURIComponent(this.nodeId)}&token=${encodeURIComponent(this.token)}`;
-    const ws = new WebSocket(url);
+    // Auth via HTTP headers (S10) rather than query strings
+    const headers = {
+      "authorization": `Bearer ${this.token}`,
+      "x-node-id": this.nodeId,
+    };
+
+    const wsOpts = { headers };
+    if (this.agent) wsOpts.agent = this.agent;
+
+    const ws = new WebSocket(this.wsUrl, wsOpts);
     this.ws = ws;
 
     ws.on("open", () => {
@@ -68,24 +74,35 @@ class MeshSocket extends EventEmitter {
     ws.on("message", (raw) => {
       let msg;
       try {
-        msg = JSON.parse(raw.toString());
+        msg = JSON.parse(raw.toString("utf8"));
       } catch {
         return;
       }
       if (msg.type) this.emit(msg.type, msg);
     });
 
-    ws.on("close", () => {
-      const wasConnected = this.connected;
-      this.connected = false;
-      clearInterval(this.heartbeatTimer);
-      if (wasConnected) this.emit("close");
-      if (this.wantConnected) this._scheduleReconnect();
+    ws.on("close", (code, reason) => {
+      this._handleClose(code, reason);
     });
 
     ws.on("error", (err) => {
       this.emit("error", err);
     });
+  }
+
+  _handleClose(code, reason) {
+    const wasConnected = this.connected;
+    this.connected = false;
+    clearInterval(this.heartbeatTimer);
+    if (wasConnected) this.emit("close", { code, reason: String(reason) });
+
+    // Stop reconnecting on 4001 (unauthorized) and 4002 (replaced by another connection) (S10, C9)
+    if (code === 4001 || code === 4002) {
+      this.wantConnected = false;
+      return;
+    }
+
+    if (this.wantConnected) this._scheduleReconnect();
   }
 
   _scheduleReconnect() {

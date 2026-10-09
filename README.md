@@ -1,12 +1,13 @@
 # sdmesh-client
 
-Client for the Secure De-centralized Mesh. This repo is **client-side only**:
+Client for sdmesh, a server-assisted private chat architecture. This repo is **client-side only**:
 CLI, local identity, local encrypted state, local event mirror. It talks to
-a headless mesh backend already deployed on Render.
+a headless server relay deployed on Render (or Tor onion service).
 
-No server code here. No dashboard. The only interface is the CLI.
+Note on architecture: while cryptographic keys and state are held locally on client nodes,
+the relay topology is **server-assisted** (clients route through a relay server) rather than a pure peer-to-peer mesh.
 
-Default backend: `https://meshcn.onrender.com`
+No server code here. No dashboard. The primary interface is the CLI.
 
 ## Install
 

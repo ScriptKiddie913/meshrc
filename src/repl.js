@@ -1,22 +1,32 @@
 "use strict";
 
+const fs = require("fs");
+const path = require("path");
 const crypto = require("crypto");
 const readline = require("readline");
+const config = require("./config");
+const localdb = require("./localdb");
 const ui = require("./ui");
 const api = require("./api");
 const identityCrypto = require("./crypto");
 const syncMod = require("./sync");
+const { askHidden } = require("./prompt");
 
 const HELP = `
 ${ui.c.bold}Commands${ui.c.reset}
   /status                 connection + sync dashboard
-  /peers                  refresh and list known peers
-  /msg <user> <text...>   send an encrypted message
+  /invite                 create an out-of-band contact exchange link
+  /accept <link>          accept an invite link and pin peer keys (TOFU)
+  /contacts               list known contacts and verification states
+  /verify <user>          show safety number (fingerprint check)
+  /msg <user> <text...>   send a sealed-sender padded encrypted message
   /history [user] [n]     show recent messages (default: all, 30)
-  /sync                   force a two-way sync with Render now
-  /backup push            push an encrypted snapshot of local state to Render
-  /backup pull            restore local state from the Render-stored snapshot
-  /whoami                 show this node's identity
+  /sync                   force a two-way sync with server now
+  /passwd                 change vault passphrase (min 12 chars)
+  /backup export [path]   export encrypted local backup
+  /backup import <path>   restore from encrypted local backup
+  /panic                  emergency secure wipe of all local data
+  /whoami                 show this node's identity & safety number
   /clear                  clear the screen
   /help                   this text
   /quit                   exit
@@ -47,7 +57,7 @@ function startRepl(ctx) {
 
   rl.on("close", () => {
     console.log(ui.dim("\nsession closed."));
-    ctx.socket.stop();
+    if (ctx.socket) ctx.socket.stop();
     ctx.db.close();
     process.exit(0);
   });
@@ -78,31 +88,92 @@ async function handleCommand(ctx, line, rl) {
           `${ui.c.bold}username${ui.c.reset}   ${ctx.username}`,
           `${ui.c.bold}node_id${ui.c.reset}    ${ctx.nodeId}`,
           `${ui.c.bold}fingerprint${ui.c.reset} ${fp}`,
-          `${ui.c.bold}render${ui.c.reset}     ${ctx.renderUrl}`,
+          `${ui.c.bold}endpoint${ui.c.reset}   ${ctx.renderUrl}`,
         ].join("\n")
       );
       break;
     }
 
-    case "/peers": {
-      if (!ctx.online) {
-        console.log(ui.warn("offline — showing local peer cache"));
-        printPeers(ctx);
+    case "/invite": {
+      // Create out-of-band contact exchange link (C1)
+      const myInboundMailbox = ctx.inboundMailbox || `mbx_${crypto.randomBytes(16).toString("hex")}`;
+      ctx.inboundMailbox = myInboundMailbox;
+
+      const params = new URLSearchParams({
+        server: ctx.renderUrl,
+        node: ctx.nodeId,
+        username: ctx.username,
+        sign: ctx.identity.signPublic,
+        ecdh: ctx.identity.ecdhPublic,
+        mailbox: myInboundMailbox,
+      });
+
+      const inviteUrl = `sdmesh://invite?${params.toString()}`;
+      console.log(ui.info("\nShare this one-time contact link with your peer out-of-band:"));
+      console.log(`${ui.c.bold}${inviteUrl}${ui.c.reset}\n`);
+
+      // Register capability on server
+      if (ctx.socket && ctx.online) {
+        ctx.socket.send({ type: "mailbox_subscribe", mailbox_id: myInboundMailbox });
+      }
+      break;
+    }
+
+    case "/accept": {
+      const link = rest[0];
+      if (!link || !link.startsWith("sdmesh://invite?")) {
+        console.log(ui.warn("usage: /accept sdmesh://invite?<params>"));
         break;
       }
-      await syncMod.refreshPeers(ctx);
-      printPeers(ctx);
+      await acceptInviteLink(ctx, link);
+      break;
+    }
+
+    case "/contacts":
+    case "/peers": {
+      printContacts(ctx);
+      break;
+    }
+
+    case "/verify": {
+      const uname = rest[0];
+      if (!uname) {
+        console.log(ui.warn("usage: /verify <username>"));
+        break;
+      }
+      const peer = ctx.db.getPeerByUsername(uname);
+      if (!peer) {
+        console.log(ui.warn(`unknown contact: ${uname}`));
+        break;
+      }
+
+      const num = identityCrypto.safetyNumber(ctx.identity.signPublic, peer.sign_public);
+      console.log(`\n${ui.c.bold}Safety Number for ${peer.username}:${ui.c.reset}`);
+      console.log(`  ${ui.c.cyan}${num}${ui.c.reset}`);
+      console.log(`Status: ${peer.status === "verified" ? ui.ok("VERIFIED") : ui.warn("MISMATCH / UNVERIFIED")}`);
+      console.log(ui.dim("Compare these digits out-of-band with your contact to verify key integrity.\n"));
+      break;
+    }
+
+    case "/msg": {
+      const match = line.match(/^\/msg\s+([^\s]+)\s+([\s\S]+)$/);
+      if (!match) {
+        console.log(ui.warn("usage: /msg <user> <text>"));
+        break;
+      }
+      const username = match[1];
+      const text = match[2];
+      await sendMessage(ctx, username, text);
       break;
     }
 
     case "/sync": {
       if (!ctx.online) {
-        console.log(ui.warn("offline — nothing to sync against. Message will send once Render is reachable."));
+        console.log(ui.warn("offline — nothing to sync right now"));
         break;
       }
-      const res = await syncMod.syncNow(ctx);
-      await syncMod.refreshPeers(ctx);
-      console.log(ui.ok(`synced — global_seq ${res.global_seq}, ${(res.missing_events || []).length} new event(s) pulled`));
+      await syncMod.syncNow(ctx);
+      console.log(ui.ok("synced with server"));
       break;
     }
 
@@ -114,7 +185,7 @@ async function handleCommand(ctx, line, rl) {
         const uname = args.shift();
         const peer = ctx.db.getPeerByUsername(uname);
         if (!peer) {
-          console.log(ui.warn(`unknown peer: ${uname}`));
+          console.log(ui.warn(`unknown contact: ${uname}`));
           break;
         }
         peerNodeId = peer.node_id;
@@ -128,28 +199,110 @@ async function handleCommand(ctx, line, rl) {
       }
       for (const m of msgs) {
         const who = m.peer_username || m.peer_node_id;
-        if (m.direction === "in") console.log(ui.msgIn(who, m.plaintext, m.created_at));
-        else console.log(ui.msgOut(who, m.plaintext, m.status, m.created_at));
+        const cleanText = identityCrypto.sanitizeTerminal(m.plaintext);
+        if (m.direction === "in") console.log(ui.msgIn(who, cleanText, m.created_at));
+        else console.log(ui.msgOut(who, cleanText, m.status, m.created_at));
       }
       break;
     }
 
-    case "/msg": {
-      const username = rest.shift();
-      const text = rest.join(" ");
-      if (!username || !text) {
-        console.log(ui.warn("usage: /msg <user> <text>"));
+    case "/passwd": {
+      const currentPass = await askHidden("Current passphrase: ");
+      let decrypted;
+      try {
+        decrypted = identityCrypto.decryptBlob(config.loadIdentityBlob(), currentPass);
+      } catch {
+        console.log(ui.warn("Incorrect current passphrase."));
         break;
       }
-      await sendMessage(ctx, username, text);
+      const newPass = await askHidden("New passphrase (min 12 chars): ");
+      const strength = identityCrypto.checkPassphraseStrength(newPass);
+      if (!strength.valid) {
+        console.log(ui.warn(strength.message));
+        break;
+      }
+      const confirm = await askHidden("Confirm new passphrase: ");
+      if (confirm !== newPass) {
+        console.log(ui.warn("Passphrases did not match."));
+        break;
+      }
+      config.saveIdentityBlob(identityCrypto.encryptBlob(decrypted, newPass));
+      ctx.passphrase = newPass;
+      console.log(ui.ok("Vault passphrase successfully changed."));
       break;
+    }
+
+    case "/panic": {
+      console.log(ui.warn("\n!!! EMERGENCY SECURE WIPE INITIATED !!!"));
+      console.log(ui.warn("Shredding and destroying local keys, database, and configurations..."));
+      if (ctx.socket) ctx.socket.stop();
+      ctx.db.close();
+      localdb.secureWipe(config.DB_PATH);
+      localdb.secureWipe(config.DB_PATH + "-wal");
+      localdb.secureWipe(config.DB_PATH + "-shm");
+      localdb.secureWipe(config.IDENTITY_PATH);
+      localdb.secureWipe(config.CONFIG_PATH);
+      console.log(ui.ok("All local data shredded. Exiting immediately.\n"));
+      process.exit(0);
     }
 
     case "/backup": {
       const sub = rest[0];
-      if (sub === "push") await backupPush(ctx);
-      else if (sub === "pull") await backupPull(ctx);
-      else console.log(ui.warn("usage: /backup push | /backup pull"));
+      if (sub === "export") {
+        const exportPath = rest[1] || path.join(config.CONFIG_DIR, `backup-${Date.now()}.enc.json`);
+        const allMsgs = ctx.db.listMessages(null, 10000);
+        const allPeers = ctx.db.listPeers();
+        const sentHistory = {};
+        for (const p of allPeers) {
+          sentHistory[p.node_id] = ctx.db.getSentHistory(p.node_id);
+        }
+        const recoveryKey = crypto.randomBytes(16).toString("hex");
+        const backupBlob = identityCrypto.exportEncryptedBackup(
+          { messages: allMsgs, peers: allPeers, sentHistory },
+          recoveryKey
+        );
+        fs.writeFileSync(exportPath, JSON.stringify(backupBlob, null, 2), { mode: 0o600 });
+        console.log(ui.ok(`\n✓ Encrypted backup written to ${exportPath}`));
+        console.log(ui.warn(`IMPORTANT: SAVE THIS RECOVERY KEY (offline):\n  ${ui.c.bold}${recoveryKey}${ui.c.reset}\n`));
+      } else if (sub === "import") {
+        const importPath = rest[1];
+        if (!importPath || !fs.existsSync(importPath)) {
+          console.log(ui.warn("usage: /backup import <filePath>"));
+          break;
+        }
+        const key = await askHidden("Enter backup recovery key: ");
+        try {
+          const rawBlob = JSON.parse(fs.readFileSync(importPath, "utf8"));
+          const restored = identityCrypto.importEncryptedBackup(rawBlob, key);
+          let countMsgs = 0;
+          for (const p of restored.peers || []) {
+            ctx.db.upsertPeer({
+              node_id: p.node_id,
+              username: p.username,
+              sign_public: p.sign_public,
+              ecdh_public: p.ecdh_public,
+              mySignPublic: ctx.identity.signPublic,
+            });
+          }
+          for (const m of (restored.messages || []).reverse()) {
+            ctx.db.ingestMessage({
+              direction: m.direction,
+              peerNodeId: m.peer_node_id,
+              peerUsername: m.peer_username,
+              plaintext: m.plaintext,
+              status: m.status,
+              clientEventId: m.client_event_id,
+              timestamp: m.created_at,
+            });
+            countMsgs++;
+          }
+          console.log(ui.ok(`\n✓ Backup restored successfully (${countMsgs} messages, ${(restored.peers || []).length} contacts).`));
+        } catch (err) {
+          console.log(ui.warn(`Backup restore failed: ${err.message}`));
+        }
+      } else {
+        console.log(ui.warn("usage: /backup export [path] | /backup import <path>"));
+      }
       break;
     }
 
@@ -163,102 +316,138 @@ async function handleCommand(ctx, line, rl) {
   }
 }
 
-function printPeers(ctx) {
+function printContacts(ctx) {
   const peers = ctx.db.listPeers();
   if (peers.length === 0) {
-    console.log(ui.dim("(no known peers)"));
+    console.log(ui.dim("(no contacts yet — exchange an /invite link first)"));
     return;
   }
+  console.log(`\n${ui.c.bold}Contacts:${ui.c.reset}`);
   for (const p of peers) {
-    const state = p.online ? ui.ok("ONLINE") : ui.dim("OFFLINE");
-    console.log(`  ${p.online ? ui.c.green + "●" : ui.c.gray + "○"}${ui.c.reset} ${p.username.padEnd(16)} ${state}`);
+    const isOk = p.status === "verified";
+    const statusLabel = isOk ? ui.ok("VERIFIED") : ui.warn("KEY MISMATCH");
+    const num = identityCrypto.safetyNumber(ctx.identity.signPublic, p.sign_public);
+    console.log(`  ● ${p.username.padEnd(14)} [${statusLabel}] Safety: ${num.slice(0, 11)}...`);
+  }
+  console.log("");
+}
+
+async function acceptInviteLink(ctx, link) {
+  try {
+    const url = new URL(link.replace("sdmesh://", "http://placeholder/"));
+    const peerNodeId = url.searchParams.get("node");
+    const peerUsername = url.searchParams.get("username");
+    const signPub = url.searchParams.get("sign");
+    const ecdhPub = url.searchParams.get("ecdh");
+    const peerMailbox = url.searchParams.get("mailbox");
+
+    if (!peerNodeId || !peerUsername || !signPub || !ecdhPub) {
+      console.log(ui.warn("invalid invite link: missing parameters"));
+      return;
+    }
+
+    // TOFU Key Pinning (C1)
+    const result = ctx.db.upsertPeer({
+      node_id: peerNodeId,
+      username: peerUsername,
+      sign_public: signPub,
+      ecdh_public: ecdhPub,
+      mySignPublic: ctx.identity.signPublic,
+    });
+
+    // Derive pairwise mailboxes
+    const sharedSecret = identityCrypto.deriveRawSharedSecret(ctx.identity.ecdhPrivate, ecdhPub);
+    const myInboundMailbox = identityCrypto.derivePairwiseMailbox(sharedSecret, peerNodeId, ctx.nodeId);
+    const outboundMailbox = peerMailbox || identityCrypto.derivePairwiseMailbox(sharedSecret, ctx.nodeId, peerNodeId);
+
+    ctx.db.setMailboxes(peerNodeId, myInboundMailbox, outboundMailbox);
+
+    if (ctx.socket && ctx.online) {
+      ctx.socket.send({ type: "mailbox_subscribe", mailbox_id: myInboundMailbox });
+    }
+
+    const num = identityCrypto.safetyNumber(ctx.identity.signPublic, signPub);
+    console.log(ui.ok(`\n✓ Contact "${peerUsername}" added & pinned (TOFU).`));
+    console.log(`Safety Number: ${ui.c.cyan}${num}${ui.c.reset}\n`);
+  } catch (err) {
+    console.log(ui.warn(`Failed to accept invite: ${err.message}`));
   }
 }
 
 async function sendMessage(ctx, username, text) {
   const peer = ctx.db.getPeerByUsername(username);
   if (!peer) {
-    console.log(ui.warn(`unknown peer "${username}" — try /sync or /peers`));
+    console.log(ui.warn(`unknown contact "${username}" — add via /accept <link>`));
     return;
   }
 
-  const sharedKey = identityCrypto.deriveSharedKey(ctx.identity.ecdhPrivate, peer.ecdh_public);
-  const ciphertext = identityCrypto.encryptMessage(text, sharedKey);
-  const clientEventId = crypto.randomUUID();
+  // Hard stop on key mismatch (C1)
+  if (peer.status === "key_mismatch") {
+    console.log(ui.warn(`SECURITY ALERT: Public key for "${username}" has changed! Sending blocked.`));
+    console.log(ui.warn("Use /verify to inspect the safety number before re-verifying."));
+    return;
+  }
 
-  const sentOverWs = ctx.socket.send({
-    type: "message",
-    target_node_id: peer.node_id,
-    ciphertext,
-    client_event_id: clientEventId,
+  const sharedSecret = identityCrypto.deriveRawSharedSecret(ctx.identity.ecdhPrivate, peer.ecdh_public);
+  const clientEventId = crypto.randomUUID();
+  const counter = ctx.db.nextSendCounter(peer.node_id);
+
+  // Protocol v2 Envelope (C2): Directional key, AAD binding, sealed sender, padded bucket
+  const envelope = identityCrypto.encryptEnvelope({
+    plaintext: text,
+    sharedSecret,
+    fromId: ctx.nodeId,
+    toId: peer.node_id,
+    msgId: clientEventId,
+    counter,
+    bucketSize: 1024,
   });
 
-  const status = sentOverWs ? "pending" : "queued";
-  ctx.db.addMessage({
+  // Outbox persistence FIRST (C7): Retain until recipient E2E delivered ack (Addendum 9.2)
+  ctx.db.queueOutbox({
+    clientEventId,
+    eventType: "MAILBOX_ENVELOPE",
+    payload: {
+      mailbox_id: peer.outbound_mailbox || identityCrypto.derivePairwiseMailbox(sharedSecret, ctx.nodeId, peer.node_id),
+      msg_id: clientEventId,
+      envelope,
+    },
+  });
+
+  // Record sent history for retransmit / gap filling (Addendum 9.2)
+  ctx.db.recordSentHistory({
+    peerNodeId: peer.node_id,
+    msgId: clientEventId,
+    counter,
+    envelope,
+    plaintext: text,
+  });
+
+  ctx.db.ingestMessage({
     direction: "out",
     peerNodeId: peer.node_id,
     peerUsername: peer.username,
     plaintext: text,
-    status,
+    status: "queued",
     clientEventId,
   });
 
-  if (!sentOverWs) {
-    // No live connection — fall back to the event outbox, delivered on next /sync.
-    ctx.db.queueOutbox({
-      clientEventId,
-      eventType: "MESSAGE_CREATED",
-      payload: { target_node_id: peer.node_id, ciphertext },
-    });
-    console.log(ui.msgOut(peer.username, text, "queued — offline"));
+  const mailboxId = peer.outbound_mailbox || identityCrypto.derivePairwiseMailbox(sharedSecret, ctx.nodeId, peer.node_id);
+
+  // Send via WebSocket mailbox_put if online
+  const sentOverWs = ctx.socket && ctx.socket.send({
+    type: "mailbox_put",
+    mailbox_id: mailboxId,
+    msg_id: clientEventId,
+    envelope,
+  });
+
+  if (sentOverWs) {
+    ctx.db.markMessageStatus(clientEventId, "sent");
+    console.log(ui.msgOut(peer.username, identityCrypto.sanitizeTerminal(text), "sent"));
   } else {
-    console.log(ui.msgOut(peer.username, text, "sent"));
+    console.log(ui.msgOut(peer.username, identityCrypto.sanitizeTerminal(text), "queued — offline"));
   }
-}
-
-async function backupPush(ctx) {
-  if (!ctx.online) {
-    console.log(ui.warn("offline — can't push backup right now"));
-    return;
-  }
-  const snapshot = {
-    version: 1,
-    created_at: Date.now(),
-    events: ctx.db.listAllEvents(),
-    peers: ctx.db.listPeers(),
-  };
-  const envelope = identityCrypto.encryptBlob(snapshot, ctx.passphrase);
-  await api.putBackup(ctx.renderUrl, ctx.auth, JSON.stringify(envelope));
-  console.log(ui.ok(`backup pushed — ${snapshot.events.length} event(s), ${snapshot.peers.length} peer(s), encrypted client-side`));
-}
-
-async function backupPull(ctx) {
-  if (!ctx.online) {
-    console.log(ui.warn("offline — can't pull backup right now"));
-    return;
-  }
-  let res;
-  try {
-    res = await api.getBackup(ctx.renderUrl, ctx.auth);
-  } catch (err) {
-    if (err.status === 404) return console.log(ui.warn("no backup stored on Render for this node"));
-    throw err;
-  }
-  const envelope = JSON.parse(res.blob);
-  let snapshot;
-  try {
-    snapshot = identityCrypto.decryptBlob(envelope, ctx.passphrase);
-  } catch {
-    console.log(ui.warn("could not decrypt backup — wrong passphrase for this snapshot?"));
-    return;
-  }
-  for (const p of snapshot.peers || []) {
-    ctx.db.upsertPeer(p);
-  }
-  syncMod.applyMissingEvents(ctx, snapshot.events || []);
-  console.log(
-    ui.ok(`backup restored — merged ${(snapshot.events || []).length} event(s), ${(snapshot.peers || []).length} peer(s)`)
-  );
 }
 
 module.exports = { startRepl };

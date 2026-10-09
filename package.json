@@ -9,9 +9,11 @@
   },
   "scripts": {
     "setup": "node --no-warnings src/setup.js",
-    "start": "node --no-warnings src/index.js"
+    "start": "node --no-warnings src/index.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
+    "socks-proxy-agent": "^10.1.0",
     "ws": "^8.18.0"
   },
   "license": "MIT"
